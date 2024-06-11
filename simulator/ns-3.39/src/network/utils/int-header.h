@@ -104,6 +104,9 @@ public:
 				uint8_t power_lo8, power_hi8;
 			};
 		}pint;
+		struct {
+			uint64_t ts; //WRdma 记录RTT
+	  	}WRdma;
 	};
 
 	IntHeader();

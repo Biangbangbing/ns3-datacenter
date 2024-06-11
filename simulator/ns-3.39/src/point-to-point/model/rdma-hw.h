@@ -158,6 +158,14 @@ public:
 	void SetPintSmplThresh(double p);
 	void HandleAckHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
 	void UpdateRateHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch, bool fast_react);
+
+	/*********************
+	 * WRdma
+	 ********************/
+	double m_wrdma_alpha, m_wrdma_beta;
+	//double m_wrdma_p;
+	int ReceiverCheckSeqForWRdma(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size);
+	void HandleAckWRdma(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
 };
 
 } /* namespace ns3 */

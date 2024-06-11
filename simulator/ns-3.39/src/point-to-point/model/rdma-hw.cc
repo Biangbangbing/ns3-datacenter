@@ -177,6 +177,21 @@ TypeId RdmaHw::GetTypeId (void)
 	                                  MakeUintegerChecker<uint32_t>())
 	                    .AddAttribute("PowerTCPEnabled", "to enable PowerTCP", BooleanValue(false), MakeBooleanAccessor(&RdmaHw::PowerTCPEnabled), MakeBooleanChecker())
 	                    .AddAttribute("PowerTCPdelay", "to enable PowerTCP in delaymode", BooleanValue(false), MakeBooleanAccessor(&RdmaHw::PowerTCPdelay), MakeBooleanChecker())
+						.AddAttribute("WRdmaAlpha",
+	                                  "Alpha of WRdma",
+	                                  DoubleValue(0.5),
+	                                  MakeDoubleAccessor(&RdmaHw::m_wrdma_alpha),
+	                                  MakeDoubleChecker<double>())
+	                    .AddAttribute("WRdmaBeta",
+	                                  "Beta of WRdma",
+	                                  DoubleValue(0.25),
+	                                  MakeDoubleAccessor(&RdmaHw::m_wrdma_beta),
+	                                  MakeDoubleChecker<double>())
+						// .AddAttribute("WRdmaP",
+	                    //               "P of WRdma",
+	                    //               DoubleValue(1),
+	                    //               MakeDoubleAccessor(&RdmaHw::m_wrdma_p),
+	                    //               MakeDoubleChecker<uint64_t>())
 	                    ;
 	return tid;
 }
@@ -270,6 +285,8 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
 		qp->tmly.m_curRate = m_bps;
 	} else if (m_cc_mode == 10) {
 		qp->hpccPint.m_curRate = m_bps;
+	} else if (m_cc_mode == 15) {
+		qp->wrdma.m_curRate = m_bps;
 	}
 
 	// Notify Nic
@@ -400,6 +417,8 @@ int RdmaHw::ReceiveCnp(Ptr<Packet> p, CustomHeader &ch) {
 			qp->tmly.m_curRate = dev->GetDataRate();
 		} else if (m_cc_mode == 10) {
 			qp->hpccPint.m_curRate = dev->GetDataRate();
+		} else if (m_cc_mode == 15) {
+			qp->wrdma.m_curRate = dev->GetDataRate();
 		}
 	}
 	return 0;
@@ -450,6 +469,8 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
 		HandleAckDctcp(qp, p, ch);
 	} else if (m_cc_mode == 10) {
 		HandleAckHpPint(qp, p, ch);
+	} else if (m_cc_mode == 15) {
+		HandleAckWRdma(qp, p, ch);
 	}
 	// ACK may advance the on-the-fly window, allowing more packets to send
 	dev->TriggerTransmit();
@@ -497,6 +518,35 @@ int RdmaHw::ReceiverCheckSeq(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size
 		return 3;
 	}
 }
+int RdmaHw::ReceiverCheckSeqForWRdma(uint32_t seq, Ptr<RdmaRxQueuePair> q, uint32_t size) {
+	uint32_t expected = q->ReceiverNextExpectedSeq;
+	if (seq == expected) {
+		q->ReceiverNextExpectedSeq = expected + size;
+		if (q->ReceiverNextExpectedSeq >= q->m_milestone_rx) {
+			q->m_milestone_rx += m_ack_interval;
+			return 1; //Generate ACK
+		} else if (q->ReceiverNextExpectedSeq % m_chunk == 0) {
+			return 1;
+		} else {
+			return 5;
+		}
+	} else if (seq > expected) {
+		// Generate NACK
+		if (Simulator::Now() >= q->m_nackTimer || q->m_lastNACK != expected) {
+			q->m_nackTimer = Simulator::Now() + MicroSeconds(m_nack_interval);
+			q->m_lastNACK = expected;
+			if (m_backto0) {
+				q->ReceiverNextExpectedSeq = q->ReceiverNextExpectedSeq / m_chunk * m_chunk;
+			}
+			return 2;
+		} else
+			return 4;
+	} else {
+		// Duplicate.
+		return 3;
+	}
+}
+
 void RdmaHw::AddHeader (Ptr<Packet> p, uint16_t protocolNumber) {
 	PppHeader ppp;
 	ppp.SetProtocol (EtherToPpp (protocolNumber));
@@ -568,6 +618,15 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp) {
 	uint32_t payload_size = qp->GetBytesLeft();
 	if (m_mtu < payload_size)
 		payload_size = m_mtu;
+	if (m_cc_mode == 15) { //if wrdma，cwnd decide
+		double curAvilWin = qp->wrdma.m_cwnd - (qp->snd_nxt - qp->snd_una);
+		if (curAvilWin < 1 && qp->wrdma.m_count < (1 / curAvilWin)) {
+			qp->wrdma.m_count = qp->wrdma.m_count + 1;
+			payload_size = 0;
+		} else {
+			qp->wrdma.m_count = 0;
+		}
+	}
 	Ptr<Packet> p = Create<Packet> (payload_size);
 	uint32_t sentBytes = qp->m_size - qp->GetBytesLeft();
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
@@ -1293,4 +1352,43 @@ void RdmaHw::UpdateRateHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader
 	}
 }
 
+/*********************
+ * Wide-RDMA
+ ********************/
+// void UpdateRateWRdma() {
+
+// }
+void RdmaHw::HandleAckWRdma(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch) {
+	//uint32_t ack_seq = ch.ack.seq;
+	uint64_t rtt = Simulator::Now().GetTimeStep() - ch.ack.ih.ts;
+	double win = qp->wrdma.m_cwnd;
+	if (rtt < qp->wrdma.m_TLow) { // if rtt < Tlow, cwnd increase
+	    if (qp->wrdma.m_cwnd > 1) {
+			win = win + (m_wrdma_alpha / qp->wrdma.m_cwnd);
+		} else {
+			win = win + m_wrdma_alpha;
+			m_tmly_alpha = 1;
+		}
+	} else if (rtt > qp->wrdma.m_THigh) { // if rtt > THigh, cwnd decrease 
+	    if (win > 1) {
+			win = win - 0.5;
+		} else {
+			win = win * (1 - m_wrdma_beta);
+		}
+	} else { // cwnd decrease in p
+		srand((unsigned)time(NULL));
+		double p = (rtt - qp->wrdma.m_TLow) / (qp->wrdma.m_THigh - qp->wrdma.m_TLow);
+		if ((rand() % 10) < p * 10) {
+			if (win > 1) {
+				win = win - 0.5;
+			} else {
+				win = win * (1 - m_wrdma_beta);
+			}
+		}
+	}
+	// if (win < 1) {
+	// 	qp->wrdma.m_curRate = double(win / rtt);
+	// }
+	qp->wrdma.m_cwnd = win;
+}
 }
